@@ -27,7 +27,7 @@ dependencies = [
     "httpx>=0.28.1",
     "tomlkit>=0.14.0",
     "pillow>=11.0,<12.0", # compatibility with mflux
-    "mflux==0.15.5",
+    "mflux==0.15.5; sys_platform == 'darwin'",
     "python-multipart>=0.0.21",
     "msgspec>=0.19.0",
     "zstandard>=0.23.0",
@@ -53,6 +53,12 @@ pytorch = [
     "torch>=2.0.0",
     "transformers>=4.40.0",
 ]
+rocm = [
+    "accelerate",
+    "torch==2.9.1+rocm6.4; sys_platform == 'linux'",
+    "pytorch-triton-rocm==3.5.1; sys_platform == 'linux'",
+    "sympy",
+]
 # cuda = [
 #     "mlx[cuda]==0.26.3",
 # ]
@@ -74,6 +80,16 @@ mlx = { git = "https://github.com/rltakashige/mlx-jaccl-fix-small-recv.git", bra
 # Uncomment to use local mlx/mlx-lm development versions:
 # mlx = { path = "/Users/Shared/mlx", editable=true }
 # mlx-lm = { path = "/Users/Shared/mlx-lm", editable=true }
+torch = { index = "pytorch-rocm", marker = "sys_platform == 'linux'" }
+torchvision = { index = "pytorch-rocm", marker = "sys_platform == 'linux'" }
+torchaudio = { index = "pytorch-rocm", marker = "sys_platform == 'linux'" }
+pytorch-triton-rocm = { index = "pytorch-rocm", marker = "sys_platform == 'linux'" }
+triton = { index = "pytorch-rocm", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-rocm"
+url = "https://download.pytorch.org/whl/rocm6.4"
+explicit = true
 
 [build-system]
 requires = ["uv_build>=0.8.9,<0.9.0"]

@@ -1,8 +1,8 @@
 """
 PyTorch inference engine implementation.
 
-This module provides the PytorchEngine class for running inference on NVIDIA GPUs
-using PyTorch and HuggingFace Transformers. It supports:
+This module provides the PytorchEngine class for running inference on NVIDIA
+and AMD (ROCm) GPUs using PyTorch and HuggingFace Transformers. It supports:
 - Model loading via AutoModelForCausalLM
 - Pipeline parallelism for distributed inference
 - Streaming text generation with TextIteratorStreamer
@@ -28,6 +28,7 @@ from exo.worker.engines.pytorch.auto_parallel import (
     MockDistributedGroup,
     pipeline_auto_parallel,
 )
+from exo.shared.types.worker.shards import PipelineShardMetadata, TensorShardMetadata
 
 # Standard tool call markers used by most HuggingFace models
 TOOL_CALL_START = "<tool_call>"
@@ -35,6 +36,52 @@ TOOL_CALL_END = "</tool_call>"
 
 # Default max tokens if not specified in request (matches MLX's default)
 MAX_TOKENS: int = 32168
+
+
+def _detect_device() -> tuple[str, torch.dtype]:
+    """
+    Detect the best available compute device and appropriate dtype.
+
+    ROCm-enabled PyTorch exposes AMD GPUs via the same torch.cuda API,
+    so torch.cuda.is_available() returns True on both NVIDIA and AMD ROCm.
+
+    Returns:
+        Tuple of (device_string, torch_dtype)
+        - "cuda" for NVIDIA or AMD ROCm GPUs  (dtype: bfloat16 if supported, else float16)
+        - "cpu" as fallback                    (dtype: float32)
+    """
+    if not torch.cuda.is_available():
+        return "cpu", torch.float32
+
+    device_name = torch.cuda.get_device_name(0).lower()
+    is_amd = any(k in device_name for k in ("amd", "radeon", "navi", "vega", "gfx"))
+
+    if is_amd:
+        logger.info(f"AMD GPU detected: {torch.cuda.get_device_name(0)} (ROCm)")
+        # gfx1100 (7900XTX) supports bfloat16 — prefer it over float16
+        # for better numerical stability during long thinking chains
+        dtype = torch.bfloat16 if _rocm_supports_bfloat16() else torch.float16
+    else:
+        logger.info(f"NVIDIA GPU detected: {torch.cuda.get_device_name(0)}")
+        # Ampere+ (compute capability >= 8.0) supports bfloat16 natively
+        cap_major = torch.cuda.get_device_capability(0)[0]
+        dtype = torch.bfloat16 if cap_major >= 8 else torch.float16
+
+    return "cuda", dtype
+
+
+def _rocm_supports_bfloat16() -> bool:
+    """
+    Check if the AMD GPU supports bfloat16.
+    gfx1100 (RDNA3, 7900XTX) does support bfloat16.
+    Older GCN cards may not.
+    """
+    try:
+        t = torch.zeros(1, dtype=torch.bfloat16, device="cuda")
+        del t
+        return True
+    except Exception:
+        return False
 
 
 def _parse_json_tool_call(text: str) -> dict[str, Any]:
@@ -74,7 +121,10 @@ class PytorchEngine(Engine):
     """
     PyTorch-based inference engine using HuggingFace Transformers.
 
-    This engine supports NVIDIA GPUs and can run on Linux systems.
+    Supports NVIDIA GPUs (CUDA) and AMD GPUs (ROCm) on Linux.
+    ROCm is accessed transparently via the torch.cuda API when the
+    ROCm-enabled PyTorch wheel is installed.
+
     Pipeline parallelism is supported for distributed inference.
     Streaming is implemented via TextIteratorStreamer.
     """
@@ -82,6 +132,8 @@ class PytorchEngine(Engine):
     def __init__(self, bound_instance: BoundInstance):
         super().__init__(bound_instance)
         self._model_name = bound_instance.instance.shard_assignments.model_id
+        self._device, self._dtype = _detect_device()
+        logger.info(f"PytorchEngine using device={self._device}, dtype={self._dtype}")
 
     def initialize_distributed_group(self) -> Any:
         """Initialize distributed group (mock for now)."""
@@ -94,32 +146,48 @@ class PytorchEngine(Engine):
     ) -> tuple[Any, Any]:
         """Load HuggingFace model and tokenizer."""
         shard_meta = self.shard_metadata
-        if not isinstance(shard_meta, PipelineShardMetadata):
+        if not isinstance(shard_meta, PipelineShardMetadata) and not isinstance(shard_meta, TensorShardMetadata):
             raise TypeError(
                 f"PytorchEngine requires PipelineShardMetadata, got {type(shard_meta).__name__}"
             )
 
         logger.info(
-            f"Loading model: {self._model_name} for shard {shard_meta.device_rank}/{shard_meta.world_size}"
+            f"Loading model: {self._model_name} "
+            f"for shard {shard_meta.device_rank}/{shard_meta.world_size} "
+            f"on {self._device} ({self._dtype})"
         )
-        self.tokenizer = AutoTokenizer.from_pretrained(self._model_name)
-        self.model = AutoModelForCausalLM.from_pretrained(self._model_name)
 
-        # Apply pipeline parallelism
+        self.tokenizer = AutoTokenizer.from_pretrained(self._model_name)
+
+        # Load with appropriate dtype for the detected device.
+        # device_map="auto" lets HuggingFace distribute layers across VRAM + RAM
+        # automatically, which is important when the model is larger than VRAM.
+        # For pipeline-parallel shards we override with explicit shard slicing
+        # in pipeline_auto_parallel below, but device_map still helps with
+        # the initial load when VRAM is tight.
+        self.model = AutoModelForCausalLM.from_pretrained(
+            self._model_name,
+            torch_dtype=self._dtype,
+            device_map="auto" if self._device == "cuda" else None,
+            low_cpu_mem_usage=True,
+        )
+
+        # Apply pipeline parallelism (layer slicing for this shard)
         self.model = pipeline_auto_parallel(self.model, self.group, shard_meta)
 
-        # Move model to GPU if available
-        if torch.cuda.is_available():
-            self.model.to("cuda")
-            logger.info("Model moved to GPU.")
+        # If device_map="auto" was not used (CPU path), move manually
+        if self._device == "cpu":
+            logger.warning("No GPU available — running on CPU. Expect slow inference.")
         else:
-            logger.warning("CUDA not available, model will run on CPU.")
+            # device_map="auto" already placed layers; log confirmation
+            if hasattr(self.model, "hf_device_map"):
+                logger.info(f"HuggingFace device map: {self.model.hf_device_map}")
 
         return self.model, self.tokenizer
 
     def warmup_inference(self) -> int:
         """Warmup not implemented for PyTorch yet."""
-        # TODO: Run a small generation to warm up CUDA kernels
+        # TODO: Run a small generation to warm up GPU kernels
         return 0
 
     def generate(
@@ -173,8 +241,12 @@ class PytorchEngine(Engine):
             raise ValueError("No input messages provided")
 
         inputs = self.tokenizer(prompt, return_tensors="pt")
-        if torch.cuda.is_available():
-            inputs = {k: v.to("cuda") for k, v in inputs.items()}
+
+        # Move inputs to the same device as the model's first parameter
+        # Using self._device directly avoids issues with device_map splitting
+        # the model across multiple devices (inputs go to the first layer's device)
+        first_device = next(self.model.parameters()).device
+        inputs = {k: v.to(first_device) for k, v in inputs.items()}
 
         prompt_tokens = inputs["input_ids"].shape[1]
 
@@ -217,7 +289,6 @@ class PytorchEngine(Engine):
         try:
             for new_text in streamer:
                 if new_text:  # Skip empty strings
-                    # Count actual tokens, not text chunks (streamer may batch)
                     chunk_token_count: int = len(
                         self.tokenizer.encode(new_text, add_special_tokens=False)
                     )  # pyright: ignore[reportAny]
@@ -251,13 +322,13 @@ class PytorchEngine(Engine):
         )
 
     def cleanup(self) -> None:
-        """Clean up PyTorch resources."""
+        """Clean up GPU resources."""
         if self.model is not None:
             del self.model
         if self.tokenizer is not None:
             del self.tokenizer
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+            torch.cuda.ipc_collect()
         import gc
-
         gc.collect()
